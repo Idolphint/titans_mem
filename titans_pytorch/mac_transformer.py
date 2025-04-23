@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import pdb
 from typing import Callable
 
 from math import ceil
@@ -123,10 +125,10 @@ def pad_and_segment_with_inverse(
     if needs_pad:
         seq = F.pad(seq, (0, 0, 0, padding))
 
-    if fold_into_batch:
+    if fold_into_batch:  # 将bsd的seq根据window size拆开，并把windows数量合并到了batch里
         seq = rearrange(seq, 'b (w n) d -> (b w) n d', n = segment_len)
 
-    def inverse(out):
+    def inverse(out):  # 给出了拆解多chunk并还原的方法
 
         if fold_into_batch:
             out = rearrange(out, '(b w) ... n d -> b ... (w n) d', b = batch)
@@ -257,7 +259,7 @@ class SegmentedAttention(Module):
 
         # caching
 
-        ck, cv = cache
+        ck, cv = cache  # 似乎是通过把过去的k,v拼接起来，实现对过去上下文的查询
         k = cat((ck, k), dim = -2)
         v = cat((cv, v), dim = -2)
 
@@ -383,7 +385,7 @@ class SegmentedAttention(Module):
 
         batch, seq_len = seq.shape[:2]
 
-        # auto pad to multiple
+        # auto pad to multiple 将seq分散成了chunk/segment
 
         seq, inverse_segment = pad_and_segment_with_inverse(seq, total_segment_len, fold_into_batch = False)
 
@@ -408,7 +410,7 @@ class SegmentedAttention(Module):
 
         # relative positions
 
-        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)  # 旋转位置编码被拼接到q,k上
 
         # fold
 
@@ -418,7 +420,7 @@ class SegmentedAttention(Module):
 
         attend_kwargs = dict()
 
-        if self.sliding:
+        if self.sliding:  ## 构建滑窗记忆，其中q和k的距离不超过指定值时mask>0
             k, v = tuple(rearrange(t, '(b w) ... -> b w ...', b = batch) for t in (k, v))
             k, v = tuple(pad_at_dim(t, (1, 0), value = 0., dim = 1) for t in (k, v))
             k = cat((k[:, :-1], k[:, 1:]), dim = -2)
@@ -476,13 +478,13 @@ class MemoryAsContextTransformer(Module):
         num_tokens,
         dim,
         depth,
-        segment_len,
+        segment_len,  # default=32
         neural_memory_segment_len = None,
         neural_mem_gate_attn_output = False,
         neural_memory_add_value_residual = False,
         num_longterm_mem_tokens = 0,
         num_persist_mem_tokens = 0,
-        neural_memory_batch_size = None,
+        neural_memory_batch_size = None,  # =128
         neural_memory_qkv_receives_diff_views = False,
         dim_head = 64,
         heads = 8,
@@ -545,7 +547,7 @@ class MemoryAsContextTransformer(Module):
 
             # attention and feedforward
 
-            attn = SegmentedAttention(
+            attn = SegmentedAttention(   # 该模型是真正的atten结果，注意力存在窗口
                 dim = dim,
                 dim_head = dim_head,
                 heads = heads,
@@ -561,9 +563,10 @@ class MemoryAsContextTransformer(Module):
             mem_qkv_layer_selector = None
             mem_hyper_conn = None
 
-            if layer in neural_memory_layers:
+            if layer in neural_memory_layers:  # 记忆层隔一层有一个？
                 mem_hyper_conn = init_hyper_conn(add_branch_out_to_residual = not neural_mem_gate_attn_output)
 
+                # 这部分为每层的每个qkv都可以自适应的选择输入来源，每层都有attn_inp,att out,ff inp, ff out, 4个上层的结果和一个当前自身residual，而且每层都可获取前面所有层的结果，因此实现了跨层注意力选择器，注意q,kv可以有不同的选择逻辑，这种选择仅跟当前输入有关
                 if not is_first and neural_memory_qkv_receives_diff_views:
                     num_layer_choices = (layer - 1) * 4 + 1 # for each layer, have memory input select from attn inp, attn out, ff inp, and ff out - plus one for the current point in the residual stream (memory input)
 
@@ -592,9 +595,9 @@ class MemoryAsContextTransformer(Module):
                 mem_hyper_conn,
                 init_hyper_conn(),
                 init_hyper_conn(),
-                mem_qkv_layer_selector,
-                mem,
-                attn,
+                mem_qkv_layer_selector,  # 根据输入获取qkv的信息来源
+                mem,  # 直接根据输入获得mem的输出
+                attn,  # 直接根据输入获得attn输出
                 ff,
             ]))
 
@@ -633,7 +636,7 @@ class MemoryAsContextTransformer(Module):
         segment_len, num_mem = self.segment_len, self.num_longterm_mem_tokens
         return ((seq_len - 1) // segment_len) * num_mem + seq_len
 
-    @torch.no_grad()
+    @torch.no_grad()  # 此处为测试用法
     def sample(
         self,
         prompt: Tensor,
@@ -686,7 +689,7 @@ class MemoryAsContextTransformer(Module):
                 if not exists(logits):
                     continue
 
-                logits = logits[:, -1]
+                logits = logits[:, -1]  # 由于一直使用最后一位，所以最开始时一口气输入了全部的内容，
 
                 logits = filter_fn(logits, **filter_kwargs)
                 sample = gumbel_sample(logits, temperature = temperature)
@@ -709,14 +712,14 @@ class MemoryAsContextTransformer(Module):
         factorized_pos_emb = None
     ):
 
-        if return_loss:
+        if return_loss:  # 这是根据过去所有词预测下一个词的任务
             x, labels = x[:, :-1], x[:, 1:]
 
         # math
 
         batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_tokens, attn_window_size = *x.shape, self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens, self.attn_window_size
 
-        seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)
+        seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)  # 这是将完整的seq裁剪成为每段长seq_len的小段，并给除了第一段的每段加上长期记忆
 
         # token embedding
 
@@ -726,21 +729,21 @@ class MemoryAsContextTransformer(Module):
 
         x, inverse_segment = pad_and_segment_with_inverse(x, segment_len, inverse_remove_pad = False)
 
-        mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])
+        mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])  # 这里应该是将永久记忆拆成了多份，永久记忆与时间无关
         x, inverse_pack_mems = pack_with_inverse((x, mems), 'b * d')
 
-        x = inverse_segment(x)
+        x = inverse_segment(x)  # 此时是合并完长期记忆并还原为 b,s,d的样子但s中间已经插入了长期记忆
 
         # splice out unneeded tokens from padding for longterm mems
 
         x = x[:, :seq_len_with_mem]
 
-        # apply axial positional embedding
+        # apply axial positional embedding 使用绝对位置编码将全局位置(完整seq的位置)和局部位置(单段位置)都编码了
         # so intra and inter segment can be more easily discerned by the network
 
         pos_emb = self.axial_pos_emb.forward_with_seq_len(seq_len_with_mem, (neural_mem_segment_len,), factorized = factorized_pos_emb)
 
-        x = x + pos_emb
+        x = x + pos_emb  # 绝对位置编码是直接加在x上的
 
         # prep flex attention
 
@@ -756,7 +759,7 @@ class MemoryAsContextTransformer(Module):
 
         is_inferencing = exists(cache)
 
-        if not exists(cache):
+        if not exists(cache):  # 如果空cache，那么直接推断最后一位
             cache = (seq_len_with_mem - 1, None, None)
 
         inference_seq_index, kv_caches, neural_mem_caches = cache
@@ -781,7 +784,7 @@ class MemoryAsContextTransformer(Module):
 
         # when inferencing, only do one token at a time
 
-        if is_inferencing:
+        if is_inferencing:  # 注意到测试时每次输入1token那么谁在更新现在进行到哪个token了？原来是在cache中存储的
             ind = inference_seq_index
             x = x[:, ind:(ind + 1)]
 
@@ -797,7 +800,7 @@ class MemoryAsContextTransformer(Module):
 
             # maybe neural memory
 
-            if exists(mem):
+            if exists(mem):  #输入的都是多个chunk构成一个长seq的形式
 
                 mem_input, add_residual = mem_hyper_conn(x)
 

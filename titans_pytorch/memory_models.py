@@ -58,6 +58,7 @@ class MemoryMLP(Module):
         depth,
         expansion_factor = 2.
     ):
+        # 一个多层的记忆矩阵，只有gelu激活是额外操作
         super().__init__()
         dim_hidden = int(dim * expansion_factor)
         dims = (dim, *((dim_hidden,) * (depth - 1)), dim)
@@ -66,6 +67,11 @@ class MemoryMLP(Module):
 
         for weight in self.weights:
             nn.init.xavier_uniform_(weight)
+
+    def init_weights(self):
+        for weight in self.weights:
+            nn.init.xavier_uniform_(weight)
+        return self.weights
 
     def forward(
         self,

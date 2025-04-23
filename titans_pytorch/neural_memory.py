@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import pdb
 from typing import Callable
 
 import math
@@ -284,7 +286,7 @@ class NeuralMemory(Module):
 
         # norms
 
-        self.retrieve_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
+        self.retrieve_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()  # 仅除以方差的Norm
         self.store_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
 
         self.multihead_rmsnorm = MultiheadRMSNorm(dim_head, heads) if post_rmsnorm else nn.Identity()
@@ -358,7 +360,7 @@ class NeuralMemory(Module):
         self.chunk_size = chunk_size
 
         # prepare function for per sample gradients from model above, using torch.func
-
+        # 注意，整个memory model的参数都是通过函数传递的，所以需要函数返回其weights，并在每次执行存取记忆时使用weights
         def forward_and_loss(params, inputs, loss_weights, target):
             pred = functional_call(self.memory_model, params, inputs)
             loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
@@ -402,9 +404,9 @@ class NeuralMemory(Module):
         assert not (attn_pool_chunks and chunk_size == 1), '`attn_pool_chunks` cannot be set to True if `chunk_size` is set to 1'
 
         if not attn_pool_chunks:
-            self.reduce_to_chunk_rep = AveragePool(chunk_size = chunk_size)
+            self.reduce_to_chunk_rep = AveragePool(chunk_size = chunk_size)  # 这里是在chunk维度上进行了平均，因此数据似乎有所损失？
         else:
-            self.reduce_to_chunk_rep = AttentionPool(dim, chunk_size = chunk_size)
+            self.reduce_to_chunk_rep = AttentionPool(dim, chunk_size = chunk_size)  # 在chunk维度进行了注意力计算，然后平均
 
         # learned adaptive learning rate
 
@@ -418,7 +420,7 @@ class NeuralMemory(Module):
 
         self.adaptive_step_transform = adaptive_step_transform
 
-        # momentum related
+        # momentum related  # TODO 怀疑是与S的控制因子有关(theta/n与输入相关)
 
         self.to_momentum = Sequential(
             nn.Linear(dim, heads * momentum_order),
@@ -443,7 +445,7 @@ class NeuralMemory(Module):
 
             self.learned_combine_include_zeroth = learned_combine_include_zeroth
 
-        # per layer learning rate modulation
+        # per layer learning rate modulation 根据输入，获取对每一层memory model参数的权重，算是lr控制因子？
 
         self.to_layer_modulation = Sequential(
             nn.Linear(dim, heads * self.num_memory_parameter_tensors),
@@ -453,7 +455,7 @@ class NeuralMemory(Module):
 
         self.max_mem_layer_modulation = max_mem_layer_modulation
 
-        # learned weight residual
+        # learned weight residual，看名字像是在学习每个head的残差权重，决定原始数据更重要还是处理数据重要
 
         self.to_learned_weight_residual_mix = Sequential(
             nn.Linear(dim, heads),
@@ -530,12 +532,12 @@ class NeuralMemory(Module):
 
     def store_memories(
         self,
-        seq,
-        weights: dict[str, Tensor] | None = None,
-        past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
-        seq_index = 0,
-        prev_weights = None,
-        mask: Tensor | None = None,
+        seq,  # 输入序列
+        weights: dict[str, Tensor] | None = None,  # weights就是当前正在使用的记忆权重本身，如果不初始化则记忆被清零
+        past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,  # 用于动量更新的之前的记忆状态
+        seq_index = 0,  # 当前序列在总体序列的位置，可用于对齐chunk
+        prev_weights = None,  # 上一层的记忆，这里针对多层记忆网络，主要用于跨层残差更新，属于高级点的残差连接
+        mask: Tensor | None = None,  # 控制哪些位置可以用于记忆更新
         return_surprises = True
     ):
         if self.qkv_receives_diff_views:
@@ -547,7 +549,7 @@ class NeuralMemory(Module):
 
         heads, chunk_size, num_updates = self.heads, self.store_chunk_size, self.num_kv_per_token
 
-        # curtail sequence by multiple of the chunk size
+        # curtail sequence by multiple of the chunk size 将一个长序列分割成多个chunk
         # only a complete chunk of the sequence provides the memory for the next chunk
 
         round_down_seq_len = round_down_multiple(seq_len, chunk_size)
@@ -583,11 +585,11 @@ class NeuralMemory(Module):
         # derive learned hparams for optimization of memory network
 
         adaptive_lr = self.to_adaptive_step(seq)
-        adaptive_lr = self.adaptive_step_transform(adaptive_lr)
+        adaptive_lr = self.adaptive_step_transform(adaptive_lr)  # 根据输入获得的lr，最大为1e-2
 
-        chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
+        chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)  # [b,s,d]->[b,n,c,d], s=n*c 从seq变成了chunk，然后压缩了n这个维度，减少了计算量
 
-        decay_factor = self.to_decay_factor(chunked_seq).sigmoid()
+        decay_factor = self.to_decay_factor(chunked_seq).sigmoid()  # 姑且认为是对S的decay
 
         need_layer_lr_mod = exists(self.to_layer_modulation) and num_chunks > 0
         has_momentum = exists(self.to_momentum)
@@ -617,7 +619,7 @@ class NeuralMemory(Module):
         keys = self.k_norm(keys)
 
         # take care of chunking
-
+        # 这里将多头(h)的k/v的seq维度拆成了n*c*u
         keys, values = tuple(rearrange(t, 'b h (n c u) d -> (b h n) (c u) d', c = chunk_size, u = num_updates) for t in (keys, values))
 
         # adaptive lr
@@ -626,7 +628,7 @@ class NeuralMemory(Module):
 
         # optionally a storing memories mask can be passed in. if False, will set the learning rate to 0. for those positions
 
-        if exists(mask):
+        if exists(mask):  # 记忆掩码用于控制那些记忆被更新
             mask = mask[..., :round_down_seq_len]
             mask = repeat(mask, 'b (n c) -> (b h n) (c u)', h = heads, u = num_updates, c = chunk_size)
 
@@ -636,14 +638,14 @@ class NeuralMemory(Module):
 
         assert xnor(exists(self.to_learned_weight_residual_mix), exists(prev_weights))
 
-        if exists(prev_weights):
+        if exists(prev_weights):  #这里将过去的NM权重进行了简单处理再残差。W = W + (H->H)W，只有从num_head到num_head的迁移
 
             start_index = math.ceil(seq_index / chunk_size)
             end_index = start_index + num_chunks
 
             prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
 
-            if exists(self.to_learned_weight_residual_mix) and num_chunks > 0:
+            if exists(self.to_learned_weight_residual_mix) and num_chunks > 0:  # weight residual就是为了实现M=（alpha）*Mt-1 + S, S就是根据chunked更新的结果
                 mix = self.to_learned_weight_residual_mix(chunked_seq)
                 mix = rearrange(mix, 'b h n -> (b h) n')
                 prev_weights = prev_weights.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
@@ -654,12 +656,12 @@ class NeuralMemory(Module):
 
         weights_for_surprise = rearrange_dict_values(weights_for_surprise, 'b n ... -> (b n) ...')
 
+        # print(batch, seq_len, keys.shape)
+        # for para_name, wei in weights_for_surprise.items():
+        #     print(para_name, wei.shape, weights[para_name].shape)
         # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
-
         grads, unweighted_mem_model_loss = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
-
         grads = TensorDict(grads)
-
         # surprises
 
         adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
@@ -680,9 +682,8 @@ class NeuralMemory(Module):
             grads = TensorDict({name: einx.multiply('b h, b h ... -> b h ...', layer_lr_mod, t) for layer_lr_mod, (name, t) in zip(layer_lr_mod, grads.items())})
 
         # negative gradients, adaptive lr already applied as loss weight
-
         surprises = grads.mul(-1)
-
+        # print("neg", torch.cuda.memory_allocated() // 1024 ** 2, "MB", g_size // 1024 ** 2)
         # past states
 
         if not exists(past_state):
@@ -715,7 +716,7 @@ class NeuralMemory(Module):
         next_last_update = TensorDict()
         next_last_momentum = TensorDict()
 
-        for (param_name, surprise), (_, last_update) in zip(surprises.items(), past_last_update.items()):
+        for (param_name, surprise), (_, last_update) in zip(surprises.items(), past_last_update.items()):  # 这里会根据每一层逐步更新
 
             update = surprise
 
@@ -728,10 +729,11 @@ class NeuralMemory(Module):
 
                 last_momentum = past_last_momentum[param_name]
 
-                # go from first order momentum all the way to the Nth
+                # go from first order momentum all the way to the Nth 从原本的suprise开始进行N次迭代就是N阶动量，原文是1阶动量
+                # 1阶动量可写为：momentum=adaptive * last_moment + LOSS 与原文一致
 
-                for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):
-                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) # momentum is S / surprise in the paper
+                for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):  # momentum=adaptive * last_moment + momentum
+                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) # momentum is S / surprise in the paper  # 理解为文中的S值，或许应区分文中的suprise和loss
 
                     momentums.append(momentum)
 
@@ -745,11 +747,10 @@ class NeuralMemory(Module):
 
                 if not learned_combine:
                     update = momentums[-1]
-                else:
+                else:  # 如果是多阶动量则对 阶数*heads 加权求和
                     update = einsum(combine_momentums, momentums, 'o b n, o b n ... -> b n ...')
-
-            # use associative scan again for learned forgetting (weight decay) - eq (13)
-
+            # print(param_name, decay_factor.shape, update.shape, last_update.shape, decay_factor.mean(), adaptive_momentum.mean())  # last_update溶解了chunk维度
+            # use associative scan again for learned forgetting (weight decay) - eq (13) update就是M本身
             update = self.assoc_scan(1. - decay_factor, update, prev = last_update, remove_prev = False)
 
             updates[param_name] = update
@@ -863,7 +864,7 @@ class NeuralMemory(Module):
         self,
         seq,
         store_seq = None,
-        state: NeuralMemState | None = None,
+        state: NeuralMemState | None = None,  # 存储着seq_index之前的模型权重，惊喜更新等等
         detach_mem_state = False,
         prev_weights = None,
         store_mask: Tensor | None = None,
@@ -932,7 +933,7 @@ class NeuralMemory(Module):
             update_after_final_store = False
 
         # accumulate updates
-
+        # print("check split size", split_sizes)
         updates = None
 
         def accum_updates(past_updates, future_updates):
@@ -956,13 +957,13 @@ class NeuralMemory(Module):
         gate = None
 
         if exists(self.transition_gate):
-            gate = self.transition_gate.sigmoid()
+            gate = self.transi2tion_gate.sigmoid()
 
-        for ind, (store_seq_chunk, maybe_store_mask) in enumerate(zip(store_seqs, store_masks)):
+        for ind, (store_seq_chunk, maybe_store_mask) in enumerate(zip(store_seqs, store_masks)):  # 逐segment更新记忆
+
             is_last = ind == (len(store_seqs) - 1)
 
             # store
-
             next_updates, next_neural_mem_state, chunk_surprises = self.store_memories(
                 store_seq_chunk,
                 weights,
@@ -972,7 +973,7 @@ class NeuralMemory(Module):
                 mask = maybe_store_mask,
                 return_surprises = True
             )
-
+            # print("check chunk", ind, "model loss=", chunk_surprises[0].mean(), "lr=", chunk_surprises[1].mean())
             weights = next_neural_mem_state.weights
             seq_index = next_neural_mem_state.seq_index
             past_state = next_neural_mem_state.states
@@ -1014,7 +1015,7 @@ class NeuralMemory(Module):
             retrieve_seq,
             updates
         )
-
+        # print("check retrived is v?", retrieved.shape, retrieved[0,0,:10], seq[1,0,0,:10])
         # maybe detach
 
         if detach_mem_state:
