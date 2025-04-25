@@ -72,11 +72,13 @@ class DotDict(dict):
 def default_params(width=None, height=None):
     params = DotDict()
     params.graph_mode = True
-    params.chunk_size = 64
-    params.batch_size = 128
+    params.chunk_size = 32
+    params.batch_size = 16
+    params.segment_size = 64
     params.seq_len=256
     params.s_size=45
     params.world_type = 'rectangle'
+    params.device = 'cuda:1'
     params.save_prefix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     par_env = DotDict({'stay_still': True,

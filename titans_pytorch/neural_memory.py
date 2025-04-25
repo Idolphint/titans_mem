@@ -777,7 +777,6 @@ class NeuralMemory(Module):
         chunk_size = self.retrieve_chunk_size
 
         weights_have_expanded_shape = dict_get_value_shapes(weights) != self.init_weight_shape
-
         batch, seq_len = seq.shape[:2]
 
         # auto infer single token decoding, if there are only 1 set of weights and 1 token
@@ -958,7 +957,6 @@ class NeuralMemory(Module):
 
         if exists(self.transition_gate):
             gate = self.transi2tion_gate.sigmoid()
-
         for ind, (store_seq_chunk, maybe_store_mask) in enumerate(zip(store_seqs, store_masks)):  # 逐segment更新记忆
 
             is_last = ind == (len(store_seqs) - 1)
@@ -1011,7 +1009,7 @@ class NeuralMemory(Module):
             last_update, _ = next_neural_mem_state.states
             updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
 
-        retrieved = self.retrieve_memories(
+        retrieved = self.retrieve_memories(  # 取出记忆使用的权重是带seq的，没有进行信息融合
             retrieve_seq,
             updates
         )
@@ -1022,7 +1020,6 @@ class NeuralMemory(Module):
             next_neural_mem_state = mem_state_detach(next_neural_mem_state)
 
         # returning
-
         if not return_surprises:
             return retrieved, next_neural_mem_state
 

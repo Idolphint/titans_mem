@@ -82,7 +82,6 @@ class MemoryMLP(Module):
 
             if not is_first:
                 x = F.gelu(x)
-
             x = x @ weight
 
         return x
