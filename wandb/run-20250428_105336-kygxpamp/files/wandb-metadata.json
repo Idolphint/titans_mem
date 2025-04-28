@@ -1,0 +1,60 @@
+{
+  "os": "Linux-5.15.0-136-generic-x86_64-with-glibc2.31",
+  "python": "CPython 3.11.11",
+  "startedAt": "2025-04-28T02:53:36.584088Z",
+  "program": "/mnt/data/ltt/titans-pytorch/mac_gs_train.py",
+  "codePath": "mac_gs_train.py",
+  "git": {
+    "remote": "https://github.com/Idolphint/titans_mem.git",
+    "commit": "2d9b7ac98321511a0d0e02d225db491493a0ceaa"
+  },
+  "email": "litiantianper@outlook.com",
+  "root": "/mnt/data/ltt/titans-pytorch",
+  "host": "qiyuan-PowerEdge-R750xa",
+  "executable": "/home/ltt/.conda/envs/titans/bin/python",
+  "codePathLocal": "mac_gs_train.py",
+  "cpu_count": 40,
+  "cpu_count_logical": 80,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 4,
+  "disk": {
+    "/": {
+      "total": "740873322496",
+      "used": "107995377664"
+    }
+  },
+  "memory": {
+    "total": "66930294784"
+  },
+  "cpu": {
+    "count": 40,
+    "countLogical": 80
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada"
+    }
+  ],
+  "cudaVersion": "12.2"
+}

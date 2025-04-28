@@ -72,9 +72,9 @@ class DotDict(dict):
 def default_params(width=None, height=None):
     params = DotDict()
     params.graph_mode = True
-    params.chunk_size = 32
+    params.chunk_size = 8
     params.batch_size = 16
-    params.segment_size = 64
+    params.segment_size = 16
     params.seq_len=256
     params.s_size=45
     params.world_type = 'rectangle'
@@ -94,9 +94,9 @@ def default_params(width=None, height=None):
                   'heights': 11, # [10, 10, 11, 11, 8, 9, 10, 11, 8, 9, 10, 11, 8, 8, 9, 9] if not height else [height] * params.batch_size,
                   'rels': ['down', 'up', 'left', 'right', 'stay still'],
                   })
-    size_increase = 6
-    par_env.widths += size_increase  #[width + size_increase for width in par_env.widths]
-    par_env.heights += size_increase  # [height + size_increase for height in par_env.heights]
+    # size_increase = 3
+    # par_env.widths += size_increase  #[width + size_increase for width in par_env.widths]
+    # par_env.heights += size_increase  # [height + size_increase for height in par_env.heights]
     n_states = Rectangle.get_n_states(par_env.widths, par_env.heights)  # [Rectangle.get_n_states(width, height) for width, height in zip(par_env.widths, par_env.heights)]
 
     # repeat widths and height
@@ -105,6 +105,43 @@ def default_params(width=None, height=None):
     params.max_states = np.max(n_states)
     par_env.n_actions = len(par_env.rels) if 'stay still' not in par_env.rels else len(par_env.rels) - 1
     params.n_actions = par_env.n_actions
+    params.env = par_env
+
+    params.use_reward = True
+    return params
+
+def env_param():
+    params = DotDict()
+    params.graph_mode = True
+    params.batch_size = 4
+    params.seq_len = 256
+    params.s_size = 45
+    params.world_type = 'rectangle'
+    params.device = 'cuda:1'
+    params.save_prefix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    par_env = DotDict({'stay_still': True,
+                       'bias_type': 'angle',
+                       'direc_bias': 0.25,
+                       'angle_bias_change': 0.4,
+                       'restart_max': 40,
+                       'restart_min': 5,
+                       'seq_jitter': 30,
+                       'save_walk': 30,
+                       'sum_inf_walk': 30,
+                       'widths': 11,
+                       # [10, 10, 11, 11, 8, 9, 10, 11, 8, 9, 10, 11, 8, 8, 9, 9] if not width else [width] * params.batch_size,
+                       'heights': 11,
+                       # [10, 10, 11, 11, 8, 9, 10, 11, 8, 9, 10, 11, 8, 8, 9, 9] if not height else [height] * params.batch_size,
+                       'rels': ['down', 'up', 'left', 'right', 'stay still'],
+                       })
+
+    n_states = Rectangle.get_n_states(par_env.widths,
+                                      par_env.heights)  # [Rectangle.get_n_states(width, height) for width, height in zip(par_env.widths, par_env.heights)]
+
+    params.max_states = np.max(n_states)
+    par_env.n_actions = len(par_env.rels) if 'stay still' not in par_env.rels else len(par_env.rels) - 1
+    params.n_actions = len(par_env.rels)
     params.env = par_env
 
     params.use_reward = True

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pdb
+import time
 from typing import Callable
 
 from math import ceil
@@ -496,18 +497,26 @@ class MemoryAsContextTransformer(Module):
         use_flex_attn = False,
         sliding_window_attn = False,
         neural_mem_weight_residual = False,
-        token_emb: Module | None = None,
+        token_emb = None,  # 修改以支持gs的同时输入
+        num_act=1,
+        use_pos_emb = True,
     ):
         super().__init__()
 
-        if not exists(token_emb):
+        if token_emb is None:
             token_emb = nn.Embedding(num_tokens, dim)
+            self.act_emb = None
+        elif token_emb == "split":
+            token_emb = nn.Embedding(num_tokens, dim//2)
+            # act_emb = nn.Embedding(num_act, dim//2)
+            self.act_emb = "repeat"
 
+        self.num_tokens = num_tokens
         self.token_emb = token_emb
-
-        # absolute positions
-
-        self.axial_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2)
+        self.use_pos_emb = use_pos_emb
+        if self.use_pos_emb:
+            # absolute positions
+            self.axial_pos_emb = ContinuousAxialPositionalEmbedding(dim = dim, num_axial_dims = 2)
 
         # long term mem tokens
 
@@ -647,12 +656,14 @@ class MemoryAsContextTransformer(Module):
             min_p = 0.1,
         ),
         show_progress = True,
-        use_cache = False
+        use_cache = False,
+        left_actions = None
     ):
         was_training = self.training
         self.eval()
 
-        prompt_seq_len, out = prompt.shape[-1], prompt.clone()
+        prompt_seq_len = prompt.shape[-1] if left_actions is None else prompt.shape[-2]
+        out = prompt.clone()
         sample_num_times = max(0, seq_len - prompt_seq_len)
 
         # cache for axial pos, attention, and neural memory
@@ -664,16 +675,18 @@ class MemoryAsContextTransformer(Module):
 
         if use_cache:
             seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)
+            if self.use_pos_emb:
+                axial_dims = self.axial_pos_emb.maybe_derive_outer_dim(seq_len_with_mem, (self.neural_memory_segment_len,))
 
-            axial_dims = self.axial_pos_emb.maybe_derive_outer_dim(seq_len_with_mem, (self.neural_memory_segment_len,))
-
-            factorized_pos_emb = self.axial_pos_emb(axial_dims, return_factorized = True)
+                factorized_pos_emb = self.axial_pos_emb(axial_dims, return_factorized = True)
+            else:
+                factorized_pos_emb = None
 
         # sample
-
+        ind = prompt_seq_len
         with tqdm.tqdm(total = sample_num_times, disable = not show_progress) as pbar:
 
-            while out.shape[-1] < seq_len:
+            while ind < seq_len:
 
                 logits, next_cache = self.forward(
                     out,
@@ -690,14 +703,20 @@ class MemoryAsContextTransformer(Module):
                     continue
 
                 logits = logits[:, -1]  # 由于一直使用最后一位，所以最开始时一口气输入了全部的内容，
-
                 logits = filter_fn(logits, **filter_kwargs)
                 sample = gumbel_sample(logits, temperature = temperature)
-
-                out = torch.cat((out, sample), dim = -1)
+                if left_actions is not None:
+                    next_a = left_actions[:, ind-prompt_seq_len:ind-prompt_seq_len+1]
+                    sample = torch.cat([sample.unsqueeze(-1), next_a], dim=-1)
+                    out = torch.cat((out, sample), dim=-2)
+                else:
+                    out = torch.cat((out, sample), dim = -1)
+                ind += 1
                 pbar.update(1)
 
         self.train(was_training)
+        if left_actions is not None:
+            out = out[..., 0]  # 只返回sense
 
         return out[..., prompt_seq_len:]
 
@@ -711,22 +730,25 @@ class MemoryAsContextTransformer(Module):
         return_cache = False,
         factorized_pos_emb = None
     ):
-
-        if return_loss:  # 这是根据过去所有词预测下一个词的任务
+        if return_loss:  # 这是根据过去所有词预测下一个词的任务,x.shape=B,S
             x, labels = x[:, :-1], x[:, 1:]
 
         # math
-
-        batch, seq_len, neural_mem_segment_len, segment_len, num_longterm_mem_tokens, attn_window_size = *x.shape, self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens, self.attn_window_size
+        batch, seq_len, = x.shape[:2]
+        neural_mem_segment_len, segment_len, num_longterm_mem_tokens, attn_window_size = self.neural_memory_segment_len, self.segment_len, self.num_longterm_mem_tokens, self.attn_window_size
 
         seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)  # 这是将完整的seq裁剪成为每段长seq_len的小段，并给除了第一段的每段加上长期记忆
 
         # token embedding
-
-        x = self.token_emb(x)
-
+        if self.act_emb is None:
+            x = self.token_emb(x)
+        else:
+            s_emb = self.token_emb(x[..., 0].long())
+            x =torch.cat((s_emb, x[..., 1:]), dim = -1)
+            if return_loss:
+                labels = labels[..., 0].long()
         # intersperse longterm memory
-
+        t0 = time.time()
         x, inverse_segment = pad_and_segment_with_inverse(x, segment_len, inverse_remove_pad = False)
 
         mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])  # 这里应该是将永久记忆拆成了多份，永久记忆与时间无关
@@ -740,10 +762,10 @@ class MemoryAsContextTransformer(Module):
 
         # apply axial positional embedding 使用绝对位置编码将全局位置(完整seq的位置)和局部位置(单段位置)都编码了
         # so intra and inter segment can be more easily discerned by the network
+        if self.use_pos_emb:
+            pos_emb = self.axial_pos_emb.forward_with_seq_len(seq_len_with_mem, (neural_mem_segment_len,), factorized = factorized_pos_emb)
 
-        pos_emb = self.axial_pos_emb.forward_with_seq_len(seq_len_with_mem, (neural_mem_segment_len,), factorized = factorized_pos_emb)
-
-        x = x + pos_emb  # 绝对位置编码是直接加在x上的
+            x = x + pos_emb  # 绝对位置编码是直接加在x上的
 
         # prep flex attention
 
@@ -791,7 +813,6 @@ class MemoryAsContextTransformer(Module):
         # expand and reduce streams for hyper connections
 
         x = self.expand_streams(x)
-
         for mem_hyper_conn, attn_hyper_conn, ff_hyper_conn, mem_qkv_layer_selector, mem, attn, ff in self.layers:
 
             retrieved = None
@@ -866,7 +887,6 @@ class MemoryAsContextTransformer(Module):
             mem_input_layers.append(ff_out)
 
             x = add_ff_residual(ff_out)
-
         # taking care of cache first
         # for early return when processing long term mem tokens during inference
 
@@ -914,7 +934,6 @@ class MemoryAsContextTransformer(Module):
         x = self.norm(x)
 
         logits = self.to_logits(x)
-
         if not return_loss:
             if not return_cache:
                 return logits

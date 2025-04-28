@@ -1,5 +1,6 @@
-import pdb
 import random
+import time
+
 import tqdm
 import gzip
 import numpy as np
@@ -8,7 +9,9 @@ import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-
+from envs.data_utils import *
+from config.default_config import *
+from GMS_net import GridModule
 from adam_atan2_pytorch import AdoptAtan2
 
 from titans_pytorch import (
@@ -51,17 +54,14 @@ MEMORY_MODEL_PER_LAYER_LEARNED_LR = True
 NEURAL_MEM_WEIGHT_RESIDUAL = True               # learning to accept contributions from the weights of the previous neural mem layer brings about significant improvements. this was improvised and not in the paper, but inspired by the value residual learning free lunch paper
 NEURAL_MEM_QKV_RECEIVES_DIFF_VIEW = True        # will allow the neural memory to select what layers from which to derive queries / keys / values, effectively allowing it to graft itself to the transformer in any way to be beneficial. this is to address an issue from a phd student who noted that the mem network is learning nothing more than wk @ wv. this also generalizes all possible ways to connect the neural memory to a transformer, a sort of NAS
 
+
+# env related
+params = env_param()
 # experiment related
 
 PROJECT_NAME = 'titans-mac-transformer'
 RUN_NAME = f'mac - {NUM_LONGTERM_MEM} longterm mems, layers {NEURAL_MEM_LAYERS}'
 WANDB_ONLINE = False # turn this on to pipe experiment to cloud
-
-# perf related
-
-USE_ACCELERATED_SCAN = True
-USE_FLEX_ATTN = True
-USE_FAST_INFERENCE = False
 
 # wandb experiment tracker
 
@@ -70,18 +70,11 @@ wandb.init(project = PROJECT_NAME, mode = 'disabled' if not WANDB_ONLINE else 'o
 wandb.run.name = RUN_NAME
 wandb.run.save()
 
-# helpers
+# perf related
 
-def cycle(loader):
-    while True:
-        for data in loader:
-            yield data
-
-def decode_token(token):
-    return str(chr(max(32, token)))
-
-def decode_tokens(tokens):
-    return ''.join(list(map(decode_token, tokens)))
+USE_ACCELERATED_SCAN = True
+USE_FLEX_ATTN = True
+USE_FAST_INFERENCE = False
 
 # memory model
 
@@ -98,7 +91,7 @@ else:
 # instantiate memory-as-context transformer
 
 model = MemoryAsContextTransformer(
-    num_tokens = 256,
+    num_tokens = params.s_size,  # TODO 输入包含sense和act，需要自定义emb函数
     dim = 384,
     depth = 8,
     segment_len = WINDOW_SIZE,
@@ -123,68 +116,75 @@ model = MemoryAsContextTransformer(
         default_step_transform_max_lr = NEURAL_MEM_MAX_LR,
         use_accelerated_scan = USE_ACCELERATED_SCAN,
         per_parameter_lr_modulation = MEMORY_MODEL_PER_LAYER_LEARNED_LR
-    )
+    ),
+    token_emb="split",
+    num_act=params.n_actions,
+    use_pos_emb=False,
 ).cuda()
 
-# prepare enwik8 data
+grid_sys = GridModule(action_dim=params.n_actions, g_size=384//2).cuda()
 
-with gzip.open('./data/enwik8.gz') as file:
-    data = np.frombuffer(file.read(int(95e6)), dtype = np.uint8).copy()
-    data_train, data_val = np.split(data, [int(90e6)])
-    data_train, data_val = map(torch.from_numpy, (data_train, data_val))
 
-class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
-        super().__init__()
-        self.data = data
-        self.seq_len = seq_len
-
-    def __getitem__(self, index):
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
-        full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
-
-    def __len__(self):
-        return self.data.size(0) // self.seq_len
-
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-val_dataset   = TextSamplerDataset(data_val, SEQ_LEN)
-train_loader  = cycle(DataLoader(train_dataset, batch_size = BATCH_SIZE))
-val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE))
-
+print(params.n_actions)
 # optimizer
-
-optim = AdoptAtan2(model.parameters(), lr = LEARNING_RATE)
-
-# training
+optim = AdoptAtan2([{"params": model.parameters(), "lr": LEARNING_RATE},
+                    {"params": grid_sys.parameters(), "lr": LEARNING_RATE}])
 
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10., desc = 'training'):
     model.train()
-
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        one_data = next(train_loader)
-        pdb.set_trace()
+        # 数据准备
+        env = init_env(params)
+        traj_data = gen_data(env, params, one_hot=False)
+        p_emb, g_emb = grid_sys.gen_seq_g_both(traj_data)
+        one_data = torch.cat([torch.from_numpy(traj_data["sense"]).cuda().unsqueeze(-1), g_emb], dim=-1).float()
+
         loss = model(one_data, return_loss = True)
+        grid_loss = grid_sys.compute_loss(p_emb, g_emb, traj_data)
+        for name, l_ in grid_loss.items():
+            loss += l_
         loss.backward()
 
-    print(f'training loss: {loss.item()}')
+    # print(f'training loss: {loss.item()}')
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
-    wandb.log(dict(loss = loss.item()))
+
+    log_loss = {"total": loss.item()}
+    for k,v in grid_loss.items():
+        log_loss[k] = v.item()
+    wandb.log(log_loss)
 
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss = model(next(val_loader), return_loss = True)
-            print(f'validation loss: {loss.item()}')
+            env = init_env(params)
+            traj_data = gen_data(env, params, one_hot=False)
+            p_emb, g_emb = grid_sys.gen_seq_g_both(traj_data)
+            one_data = torch.cat([torch.from_numpy(traj_data["sense"]).cuda().unsqueeze(-1), g_emb], dim=-1).float()
+            # one_data = torch.from_numpy(np.stack([traj_data["sense"], g_emb], axis=-1)).cuda().long()
+            loss = model(one_data, return_loss=True)
+            grid_loss = grid_sys.compute_loss(p_emb, g_emb, traj_data)
+            g_loss = {k: v.item() for k, v in grid_loss.items()}
+            # loss = model(next(val_loader), return_loss = True)
+            print(f'validation loss: {loss.item()}', g_loss)
 
-    if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
+    if SHOULD_GENERATE and i % GENERATE_EVERY == 0:  # 用于可视化输出的内容
         model.eval()
-        inp = random.choice(val_dataset)[:PRIME_LENGTH]
-        prime = decode_tokens(inp)
-        print(f'%s \n\n %s', (prime, '*' * 100))
+        env = init_env(params)
+        traj_data = gen_data(env, params, GENERATE_LENGTH, one_hot=False)
+        p_emb, g_emb = grid_sys.gen_seq_g_both(traj_data)
+        one_data = torch.cat([torch.from_numpy(traj_data["sense"]).cuda().unsqueeze(-1), g_emb], dim=-1).float()
+        # one_data = torch.from_numpy(np.stack([traj_data["sense"], g_emb], axis=-1)).cuda().long()
+        inp = one_data[0, :PRIME_LENGTH]
+        left_act = one_data[0, PRIME_LENGTH:, 1:]
 
-        sample = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = USE_FAST_INFERENCE)
-        output_str = decode_tokens(sample[0])
-        print(output_str)
+        # inp = random.choice(val_dataset)[:PRIME_LENGTH]
+        # prime = decode_tokens(inp)
+        # print(f'%s \n\n %s', (prime, '*' * 100))
+
+        sample = model.sample(inp[None, ...], GENERATE_LENGTH, use_cache = USE_FAST_INFERENCE, left_actions=left_act[None, ...])
+        # output_str = decode_tokens(sample[0])
+        print("【gen】 decode acc=", (sample==one_data[0,PRIME_LENGTH:, 0]).float().mean())
+
+        torch.save(model.state_dict(), "./saved_models/mac_gs_latest.pt")

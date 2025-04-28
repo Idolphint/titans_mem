@@ -110,7 +110,7 @@ class Rectangle(Environment):
 
         self.states_mat = states_vec.astype(int)
 
-    def walk(self, rand_begin=False):  # 获得了随机的轨迹和对应的方向
+    def walk(self, rand_begin=False, seq_len=0):  # 获得了随机的轨迹和对应的方向
         """  pos-t 代表t时刻的位置，act-t代表上一时刻采取的动作，逻辑是先a后p
         #state number counts accross then down
         a = np.asarray(range(25))
@@ -126,7 +126,7 @@ class Rectangle(Environment):
         if rand_begin:
             allowed_states = np.where(np.sum(self.adj, 1) > 0)[0]
             self.start_state = np.random.choice(allowed_states)
-        time_steps = self.walk_len
+        time_steps = self.walk_len if seq_len==0 else seq_len
         position = np.zeros(time_steps, dtype=np.int16)
         direc = np.zeros((self.n_actions, time_steps))
 

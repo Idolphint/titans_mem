@@ -145,10 +145,9 @@ def softclamp_max(t, max_value):
 def softclamp_grad_norm(t, max_value):
     if is_empty_tensor(t):
         return t
-
     t, inverse = pack_one_with_inverse(t, 'bn *')
 
-    norm = t.norm(dim = -1, keepdim = True)
+    norm = t.norm(dim = -1, keepdim = True).clamp(min = 1e-12)
     clamped_norm = softclamp_max(norm, max_value)
 
     t = t * (clamped_norm / norm)
@@ -663,7 +662,9 @@ class NeuralMemory(Module):
         grads, unweighted_mem_model_loss = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
         grads = TensorDict(grads)
         # surprises
-
+        # print("check ori grad", torch.isnan(keys).any(), torch.isnan(values).any())
+        # for k,v in grads.items():
+        #     print(k, v.abs().max(), torch.isnan(v).any(), v.shape)
         adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
         unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
 
@@ -671,13 +672,17 @@ class NeuralMemory(Module):
 
         if exists(self.max_grad_norm):
             grads = grads.apply(lambda t: softclamp_grad_norm(t, self.max_grad_norm))
-
+        # print("after norm")
+        # for k,v in grads.items():
+        #     print(k, v.abs().max(), torch.isnan(v).any())
         # restore batch and sequence dimension
 
         grads = rearrange_dict_values(grads, '(b n) ... -> b n ...', b = batch * heads)
 
         # maybe per layer modulation
-
+        # print("after arrange")
+        # for k, v in grads.items():
+        #     print(k, v.abs().max(), torch.isnan(v).any())
         if need_layer_lr_mod:
             grads = TensorDict({name: einx.multiply('b h, b h ... -> b h ...', layer_lr_mod, t) for layer_lr_mod, (name, t) in zip(layer_lr_mod, grads.items())})
 
@@ -685,7 +690,9 @@ class NeuralMemory(Module):
         surprises = grads.mul(-1)
         # print("neg", torch.cuda.memory_allocated() // 1024 ** 2, "MB", g_size // 1024 ** 2)
         # past states
-
+        # print("after -1")
+        # for k, v in grads.items():
+        #     print(k, v.abs().max(), torch.isnan(v).any())
         if not exists(past_state):
             # minibatch_init_weight corresponds to W0 in figure 7 of TTT paper
 
@@ -719,9 +726,10 @@ class NeuralMemory(Module):
         for (param_name, surprise), (_, last_update) in zip(surprises.items(), past_last_update.items()):  # 这里会根据每一层逐步更新
 
             update = surprise
-
+            # print(param_name, update.abs().max(), last_update.abs().max())
             # derive momentum with associative scan - eq (10)
-
+            if torch.isnan(surprise).any() or torch.isnan(last_update).any():
+                pdb.set_trace()
             if has_momentum:
                 momentum = surprise
 
@@ -1022,5 +1030,4 @@ class NeuralMemory(Module):
         # returning
         if not return_surprises:
             return retrieved, next_neural_mem_state
-
         return retrieved, next_neural_mem_state, surprises

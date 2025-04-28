@@ -34,16 +34,22 @@ def init_env(pars):
     return env
 
 
-def sample_data(position, states_mat, s_size):
+def sample_data(position, states_mat, s_size, one_hot=True):
     # makes one-hot encoding of sensory at each time-step
     time_steps = np.shape(position)[0]
-    sense_data = np.zeros((s_size, time_steps))
+    if one_hot:
+        sense_data = np.zeros((s_size, time_steps))
+    else:
+        sense_data = np.zeros(time_steps)
     for i, pos in enumerate(position):
         ind = int(pos)
-        sense_data[states_mat[ind], i] = 1
+        if one_hot:
+            sense_data[states_mat[ind], i] = 1
+        else:
+            sense_data[i] = states_mat[ind]
     return sense_data
 
-def gen_data(env, pars):
+def gen_data(env, pars, seq_len=0, one_hot=True):
     # 准备数据
     batch_pos = []
     batch_sense = []
@@ -51,18 +57,26 @@ def gen_data(env, pars):
     batch_envs = []
 
     for b in range(pars.batch_size):
-        pos, direc = env.walk(rand_begin = False)
-        sense = sample_data(pos, env.states_mat, s_size=pars.s_size)
+        pos, direc = env.walk(rand_begin = False, seq_len=seq_len)
+        sense = sample_data(pos, env.states_mat, s_size=pars.s_size, one_hot=one_hot)
+        if not one_hot:
+            direc = np.where(direc.sum(0)==0, 0, direc.argmax(axis=0)+1)
         batch_pos.append(pos)
         batch_sense.append(sense)
         batch_dirs.append(direc)
         batch_envs.append(env)
-    data = {
-        "pos": np.asarray(batch_pos),  # B,S
-        "sense": np.asarray(batch_sense).transpose(0,2,1),  # B,S,_
-        "dirs": np.asarray(batch_dirs).transpose(0,2,1),
-    }
-    # print(data["pos"][:10,:10])
+    if one_hot:
+        data = {
+            "pos": np.asarray(batch_pos),  # B,S
+            "sense": np.asarray(batch_sense).transpose(0,2,1),  # B,S,_
+            "dirs": np.asarray(batch_dirs).transpose(0,2,1),
+        }
+    else:
+        data = {
+            "pos": np.asarray(batch_pos),  # B,S
+            "sense": np.asarray(batch_sense),
+            "dirs": np.asarray(batch_dirs)
+        }
     return data
 
 # def prepare_inputs(env, pars):

@@ -1,5 +1,7 @@
 import pdb
 import random
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -82,14 +84,30 @@ class GridModule(nn.Module):
             nn.Linear(g_size*expand_factor, g_size**2),
             nn.ReLU(),
         )
+        self.g_delta_layer = nn.Sequential(  # 根据路径积分的g和s推断的g获取本次更新的幅度
+            nn.Linear(g_size * 2+1, g_size*expand_factor),
+            nn.ELU(),
+            nn.Linear(g_size*expand_factor, g_size),
+            nn.Sigmoid(),
+        )
         self.tmp_emb = nn.Embedding(300, g_size)
         self._init_weights()
 
         self.g0 = torch.nn.Parameter(
-            torch.zeros(1, g_size), requires_grad=True
+            torch.randn(1, g_size)*0.01, requires_grad=True
         )
+        self.p2g_scale = 0.2
         self.action_dim = action_dim
         self.g_size = g_size
+        self.device = device
+
+    def get_corr_g(self, g_gen, x_mem_g, surprise):
+        delta_input = torch.cat((g_gen, x_mem_g, surprise), dim=-1)
+        delta = self.g_delta_layer(delta_input)
+
+        g_corr = g_gen + self.p2g_scale * delta * (x_mem_g - g_gen)
+        g_corr = self.norm_g(g_corr)
+        return g_corr, delta
 
     def _init_weights(self):
         for m in self.modules():
@@ -111,13 +129,17 @@ class GridModule(nn.Module):
         return new_g
 
     def gen_seq_g(self, act_seq, g0=None):
-        B,S,_ = act_seq.shape
+        B,S = act_seq.shape[:2]
         if g0 is None:
             g0 = self.g0.repeat(B, 1)
         new_g = self.norm_g(g0)  # 当前的Norm g可以进行多次而不改变结果
+
+        W_trans = self.a2trans_layer(act_seq)
+        W_trans = W_trans.reshape((B, S, self.g_size, self.g_size))
         grid_seq = []
         for t in range(S):
-            new_g = self(new_g, act_seq[:, t, :])
+            new_g = torch.einsum('bgg,bg->bg', W_trans[:, t], new_g)
+            new_g = self.norm_g(new_g)
             grid_seq.append(new_g)
         gen_g_seq = torch.stack(grid_seq, dim=1)
         return gen_g_seq
@@ -125,6 +147,31 @@ class GridModule(nn.Module):
     def gen_seq_g_tmp(self, pos_seq):
         pos_emb = self.tmp_emb(pos_seq)
         return pos_emb
+
+    def gen_seq_g_both(self, traj_data):
+        pos_seq = torch.from_numpy(traj_data["pos"]).to(self.device).long()
+        act_seq = torch.from_numpy(traj_data["dirs"]).to(self.device)
+        act_one_hot = F.one_hot(act_seq, self.action_dim).float()
+        pos_emb = self.tmp_emb(pos_seq)  # 只取t0的位置编码
+        g_emb_by_act = self.gen_seq_g(act_one_hot, g0=pos_emb[:, 0])
+
+        return pos_emb, g_emb_by_act
+
+    def compute_loss(self, p_emb, g_emb, traj_data):
+        t0 = time.time()
+        pos_seq = torch.from_numpy(traj_data["pos"]).to(self.device).long()
+        loss_kernel = F.mse_loss(p_emb, g_emb)
+        trans_equ_mask = (pos_seq[:, None] - pos_seq[:, :, None])==0
+        loss_trans = torch.mean((g_emb[:, None]-g_emb[:, :, None])[trans_equ_mask] ** 2) * self.g_size
+
+        loss_reg = 0.0
+        for name, param in self.tmp_emb.named_parameters():
+            if "weight" in name:
+                loss_reg += torch.norm(param)
+
+        loss_detail = {"kernel": loss_kernel, "reg": loss_reg, "trans": loss_trans}
+        return loss_detail
+
 
 class SimpleEncDec(nn.Module):
     def __init__(self, visual_dim, stoch_size):
@@ -218,9 +265,12 @@ class Dynamic(nn.Module):
 
         gen_g_seq = self.grid_module.gen_seq_g(act_seq, last_g)
 
-        pred_stoch, pred_stoch_corr, corr_g, next_cache = self.mem.step(gen_g_seq, stoch_seq, cache=cache,
+        pred_stoch, pred_g, g_surprise, next_cache = self.mem.step(gen_g_seq, stoch_seq, cache=cache,
                                                                     return_cache=True) # 记忆s-g双向，并返回预测的s和纠正的g
-
+        corr_g, delta_g = self.grid_module.get_corr_g(gen_g_seq, pred_g, g_surprise)
+        pred_stoch_corr = self.mem.retrieve_memories(corr_g, next_cache[0], mem_name='g2s')
+        if torch.isnan(pred_stoch_corr).any() or torch.isnan(corr_g).any():
+            pdb.set_trace()
         return pred_stoch, pred_stoch_corr, gen_g_seq, corr_g, next_cache
 
 
@@ -337,6 +387,7 @@ class Trainer:
             loss, detail = self.dynamic(pos, sense)
             self.opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.dynamic.parameters(), 1.0)
             self.opt.step()
             # self.schedule.step()
             if e % 20 == 0:
@@ -376,20 +427,28 @@ class Trainer:
                 data[k] = torch.cat([d[k] for d in seq_var], 1)
 
             # 计算损失1 积分的g与纠错的g一致
-            g_corr_loss = F.mse_loss(data['g_gen'], data['g_corr'])
+            g_corr_loss = F.mse_loss(data['g_gen'], data['g_corr'].detach())
 
             # 积分的g和纠错的g都应当取出sense
             loss_pred, acc_pred = self.dynamic.encdec.compute_loss(sense, data['pred_s'])
             loss_corr, acc_corr = self.dynamic.encdec.compute_loss(sense, data['pred_s_corr'])
 
-            loss = g_corr_loss + loss_pred + 0.001 * loss_corr
+            # sen dec lossvv
+            loss_enc, _ = self.dynamic.encdec.compute_loss(sense)
+            loss = g_corr_loss + loss_pred + 0 * loss_corr + 0.1 * loss_enc
 
             self.opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.dynamic.parameters(), 1.0)
             self.opt.step()
 
             if e % 20 == 0:
-                print(f"{e}: g_loss={g_corr_loss.item():.2f}, pred_s={loss_pred.item():.2f}, corr_s={loss_corr.item():.2f}, acc_pred={acc_pred:.2f}, acc_corr={acc_corr:.2f}")
+                print(f"{e}: g_loss={g_corr_loss.item():.3f}, pred_s={loss_pred.item():.3f}, "
+                      f"corr_s={loss_corr.item():.3f}, enc={loss_enc.item():.3f}, "
+                      f"acc_pred={acc_pred:.3f}, acc_corr={acc_corr:.3f}")
+                if e == 200:
+                    print(data["g_gen"][0,30,:10], data["g_corr"][0,30,:10])
+                    # pdb.set_trace()
 
 
     def eval(self, load=True):

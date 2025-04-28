@@ -174,11 +174,13 @@ class BiMemNet(nn.Module):
             chunk_size=chunk_size,
             batch_size=segment_size,  # 是根据batch_size将一个完整的seq分割成每个chunk 128的小段，所以这里叫batch_size不合理，
             qkv_receives_diff_views=True,
+            max_grad_norm=10.0,
         )
         self.s2g_Memory = NeuralMemory(
             dim=stoch_size,
             chunk_size=chunk_size,
             batch_size=segment_size, qkv_receives_diff_views=True,
+            max_grad_norm=10.0,
         )
         self.g_size = g_size
         self.stoch_size = stoch_size
@@ -208,16 +210,27 @@ class BiMemNet(nn.Module):
             state=g2s_cahce,
             prev_weights=None,  # 仅与layer有关，用于跨层残差更新
         )
-        g_corr, next_s2g_cache = self.s2g_Memory.forward(
+        g_corr, next_s2g_cache, g_surprise = self.s2g_Memory.forward(
             kv_4s2g,
             state=s2g_cahce,
             prev_weights=None,
+            return_surprises=True
         )
-        weights = self.get_weight_from_cache(next_g2s_cahce, eval=True)
-        pred_stoch_by_corr = self.g2s_Memory.retrieve_memories(g_corr, weights=weights)
+        g_surprise = g_surprise[0].squeeze(1).unsqueeze(-1)  # B,H,S ->B,S,1其中H代表多头的头数量
+        # weights = self.get_weight_from_cache(next_g2s_cahce, eval=True)
+        # pred_stoch_by_corr = self.g2s_Memory.retrieve_memories(g_corr, weights=weights)
         next_cache = (next_g2s_cahce, next_s2g_cache)
-        return pred_stoch, pred_stoch_by_corr, g_corr, next_cache
+        return pred_stoch, g_corr, g_surprise, next_cache
 
+    def retrieve_memories(self, keys, cache, mem_name='g2s'):
+        weights = self.get_weight_from_cache(cache, eval=True)
+        if mem_name == 's2g':
+            value = self.s2g_Memory.retrieve_memories(keys, weights)
+        elif mem_name == 'g2s':
+            value = self.g2s_Memory.retrieve_memories(keys, weights)
+        else:
+            raise NotImplementedError
+        return value
 
     def compute_loss(self, g_seq, stoch_seq, cache=None, return_cache=False):
         kv_4g2s = torch.stack((g_seq, g_seq, stoch_seq))
