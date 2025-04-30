@@ -662,9 +662,6 @@ class NeuralMemory(Module):
         grads, unweighted_mem_model_loss = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
         grads = TensorDict(grads)
         # surprises
-        # print("check ori grad", torch.isnan(keys).any(), torch.isnan(values).any())
-        # for k,v in grads.items():
-        #     print(k, v.abs().max(), torch.isnan(v).any(), v.shape)
         adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
         unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
 
@@ -688,11 +685,6 @@ class NeuralMemory(Module):
 
         # negative gradients, adaptive lr already applied as loss weight
         surprises = grads.mul(-1)
-        # print("neg", torch.cuda.memory_allocated() // 1024 ** 2, "MB", g_size // 1024 ** 2)
-        # past states
-        # print("after -1")
-        # for k, v in grads.items():
-        #     print(k, v.abs().max(), torch.isnan(v).any())
         if not exists(past_state):
             # minibatch_init_weight corresponds to W0 in figure 7 of TTT paper
 
@@ -717,12 +709,10 @@ class NeuralMemory(Module):
             return (*output, (unweighted_mem_model_loss, adaptive_lr))
 
         # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
-
         updates = TensorDict()
 
         next_last_update = TensorDict()
         next_last_momentum = TensorDict()
-
         for (param_name, surprise), (_, last_update) in zip(surprises.items(), past_last_update.items()):  # 这里会根据每一层逐步更新
 
             update = surprise
@@ -739,7 +729,6 @@ class NeuralMemory(Module):
 
                 # go from first order momentum all the way to the Nth 从原本的suprise开始进行N次迭代就是N阶动量，原文是1阶动量
                 # 1阶动量可写为：momentum=adaptive * last_moment + LOSS 与原文一致
-
                 for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):  # momentum=adaptive * last_moment + momentum
                     momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) # momentum is S / surprise in the paper  # 理解为文中的S值，或许应区分文中的suprise和loss
 
@@ -964,7 +953,7 @@ class NeuralMemory(Module):
         gate = None
 
         if exists(self.transition_gate):
-            gate = self.transi2tion_gate.sigmoid()
+            gate = self.transition_gate.sigmoid()
         for ind, (store_seq_chunk, maybe_store_mask) in enumerate(zip(store_seqs, store_masks)):  # 逐segment更新记忆
 
             is_last = ind == (len(store_seqs) - 1)

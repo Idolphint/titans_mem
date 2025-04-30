@@ -344,12 +344,11 @@ class SegmentedAttention(Module):
         # prep flex attention
 
         if not exists(flex_attn_fn):
-            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_tokens, self.sliding)
+            block_mask = create_mac_block_mask(seq_len, self.total_segment_len, self.num_persist_mem_tokens, self.sliding).to(k.device)
 
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
         # attention
-
         out = flex_attn_fn(q, k, v)
 
         out = self.merge_heads(out)
@@ -508,8 +507,15 @@ class MemoryAsContextTransformer(Module):
             self.act_emb = None
         elif token_emb == "split":
             token_emb = nn.Embedding(num_tokens, dim//2)
-            # act_emb = nn.Embedding(num_act, dim//2)
-            self.act_emb = "repeat"
+            if num_act > 10:  # 说明不是正常act而是grid
+                act_emb = nn.Sequential(
+                    nn.Linear(num_act, dim // 2),
+                    nn.LayerNorm(dim // 2),
+                    nn.ReLU(),
+                )
+            else:
+                act_emb = nn.Embedding(num_act, dim//2)
+            self.act_emb = act_emb
 
         self.num_tokens = num_tokens
         self.token_emb = token_emb
@@ -696,18 +702,27 @@ class MemoryAsContextTransformer(Module):
                     factorized_pos_emb = factorized_pos_emb
                 )
 
-                if use_cache:
-                    cache = next_cache
+                if use_cache:  # 由于输入都是全部之前的seq，所以不需要cache
+                    if cache is None:
+                        cache = next_cache
+                    else:
+                        cache = (next_cache[0], cache[1], cache[2])  # 只将mm的cache清空，其他保留
 
                 if not exists(logits):
                     continue
-
+                # if ind-prompt_seq_len < 5:
+                #     print(torch.argmax(logits, dim=-1), logits[0])
+                #     pdb.set_trace()
                 logits = logits[:, -1]  # 由于一直使用最后一位，所以最开始时一口气输入了全部的内容，
-                logits = filter_fn(logits, **filter_kwargs)
+                logits = filter_fn(logits, **filter_kwargs)  # 应该是抑制了概率较小的被取出
                 sample = gumbel_sample(logits, temperature = temperature)
+
                 if left_actions is not None:
                     next_a = left_actions[:, ind-prompt_seq_len:ind-prompt_seq_len+1]
-                    sample = torch.cat([sample.unsqueeze(-1), next_a], dim=-1)
+                    if sample.shape == next_a.shape:
+                        sample = torch.stack([sample, next_a], dim=-1)
+                    else:
+                        sample = torch.cat([sample.unsqueeze(-1), next_a], dim=-1)
                     out = torch.cat((out, sample), dim=-2)
                 else:
                     out = torch.cat((out, sample), dim = -1)
@@ -728,7 +743,8 @@ class MemoryAsContextTransformer(Module):
         disable_flex_attn = False,
         cache = None,
         return_cache = False,
-        factorized_pos_emb = None
+        factorized_pos_emb = None,
+        loss_mask = None,
     ):
         if return_loss:  # 这是根据过去所有词预测下一个词的任务,x.shape=B,S
             x, labels = x[:, :-1], x[:, 1:]
@@ -744,11 +760,13 @@ class MemoryAsContextTransformer(Module):
             x = self.token_emb(x)
         else:
             s_emb = self.token_emb(x[..., 0].long())
-            x =torch.cat((s_emb, x[..., 1:]), dim = -1)
+            a_emb = self.act_emb(x[..., 1:].squeeze(-1))
+            x =torch.cat((s_emb, a_emb), dim = -1)
             if return_loss:
-                labels = labels[..., 0].long()
+                labels = labels[..., 0]
         # intersperse longterm memory
         t0 = time.time()
+        # 将seq按照windows_size切分，这里意味着只对最近的32个序列进行attention，提前为长期记忆占好位置
         x, inverse_segment = pad_and_segment_with_inverse(x, segment_len, inverse_remove_pad = False)
 
         mems = repeat(self.longterm_mems, 'n d -> b n d', b = x.shape[0])  # 这里应该是将永久记忆拆成了多份，永久记忆与时间无关
@@ -774,7 +792,7 @@ class MemoryAsContextTransformer(Module):
         flex_attn_fn = None
 
         if use_flex_attn:
-            block_mask = create_mac_block_mask(seq_len_with_mem, self.attn_window_size, self.num_persist_mem_tokens, self.sliding_window_attn)
+            block_mask = create_mac_block_mask(seq_len_with_mem, self.attn_window_size, self.num_persist_mem_tokens, self.sliding_window_attn).to(x.device)
             flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
         # kv caching
@@ -786,24 +804,18 @@ class MemoryAsContextTransformer(Module):
 
         inference_seq_index, kv_caches, neural_mem_caches = cache
 
-        kv_caches = iter(default(kv_caches, []))
+        kv_caches = iter(default(kv_caches, []))  # 使用kv_cache和mem_cache可以在过去的序列上进行attention
         neural_mem_caches = iter(default(neural_mem_caches, []))
 
         next_kv_caches = []
         next_neural_mem_caches = []
 
         # value residual
-
         value_residual = None
-
         # neural mem weight residual
-
         mem_weight_residual = None
-
         # layers for the neural mem to select the qkv inputs from
-
         mem_input_layers = []
-
         # when inferencing, only do one token at a time
 
         if is_inferencing:  # 注意到测试时每次输入1token那么谁在更新现在进行到哪个token了？原来是在cache中存储的
@@ -940,4 +952,9 @@ class MemoryAsContextTransformer(Module):
 
             return logits, next_cache
 
-        return F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
+        loss = F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels.long(), reduction='none')
+        if loss_mask is not None:
+            loss = (loss * loss_mask[:, 1:]).sum() / (loss_mask.sum()+1e-8)
+        else:
+            loss = loss.mean()
+        return loss

@@ -3,6 +3,7 @@
 """
 @author: James Whittington
 """
+import pdb
 
 import numpy as np
 import copy as cp
@@ -110,7 +111,7 @@ class Rectangle(Environment):
 
         self.states_mat = states_vec.astype(int)
 
-    def walk(self, rand_begin=False, seq_len=0):  # 获得了随机的轨迹和对应的方向
+    def walk(self, rand_begin=False, seq_len=0, return_visited=False):  # 获得了随机的轨迹和对应的方向
         """  pos-t 代表t时刻的位置，act-t代表上一时刻采取的动作，逻辑是先a后p
         #state number counts accross then down
         a = np.asarray(range(25))
@@ -129,6 +130,8 @@ class Rectangle(Environment):
         time_steps = self.walk_len if seq_len==0 else seq_len
         position = np.zeros(time_steps, dtype=np.int16)
         direc = np.zeros((self.n_actions, time_steps))
+        visited = np.zeros(self.n_states)
+        pos_visited = np.zeros(time_steps)
 
         current_angle = np.random.uniform(-np.pi, np.pi)
 
@@ -139,7 +142,7 @@ class Rectangle(Environment):
         position[0] = int(self.start_state)
         # choose random action to have gotten to start-state - doesn't get used as g_prior is for first state
         direc[0, 0] = 1
-
+        visited[position[0]] = 1
         for i in range(time_steps - 1):
             available = np.where(self.tran[int(position[i]), :] > 0)[0].astype(int)
 
@@ -153,12 +156,14 @@ class Rectangle(Environment):
                 position[i + 1] = new_poss_pos
             else:
                 position[i + 1] = int(cp.deepcopy(position[i]))
-
+            pos_visited[i+1] = visited[position[i + 1]]
+            visited[position[i + 1]] = 1
             relation_taken, _ = self.relation(position[i], position[i + 1])
             if relation_taken < self.n_actions:
                 direc[relation_taken, i + 1] = 1
             # stay still is just a set of zeros
-
+        if return_visited:
+            return position, direc, pos_visited
         return position, direc
 
     def move_straight_bias(self, current_angle, position, available):

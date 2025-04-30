@@ -55,9 +55,10 @@ def gen_data(env, pars, seq_len=0, one_hot=True):
     batch_sense = []
     batch_dirs = []
     batch_envs = []
+    batch_visit = []
 
     for b in range(pars.batch_size):
-        pos, direc = env.walk(rand_begin = False, seq_len=seq_len)
+        pos, direc, visited = env.walk(rand_begin = False, seq_len=seq_len, return_visited=True)
         sense = sample_data(pos, env.states_mat, s_size=pars.s_size, one_hot=one_hot)
         if not one_hot:
             direc = np.where(direc.sum(0)==0, 0, direc.argmax(axis=0)+1)
@@ -65,18 +66,23 @@ def gen_data(env, pars, seq_len=0, one_hot=True):
         batch_sense.append(sense)
         batch_dirs.append(direc)
         batch_envs.append(env)
+        batch_visit.append(visited)
     if one_hot:
         data = {
             "pos": np.asarray(batch_pos),  # B,S
             "sense": np.asarray(batch_sense).transpose(0,2,1),  # B,S,_
             "dirs": np.asarray(batch_dirs).transpose(0,2,1),
+            "visit": np.asarray(batch_visit)
         }
     else:
         data = {
             "pos": np.asarray(batch_pos),  # B,S
             "sense": np.asarray(batch_sense),
-            "dirs": np.asarray(batch_dirs)
+            "dirs": np.asarray(batch_dirs),
+            "visit": np.asarray(batch_visit)
         }
+    data["dirs"][:, :-1] = data["dirs"][:, 1:]  # act需要提前一个t
+
     return data
 
 # def prepare_inputs(env, pars):

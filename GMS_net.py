@@ -54,6 +54,7 @@ class FixGridModule():
         self.module_size = [3, 7, 11]
         self.g_size = g_size
         self.max_states = max_states
+        self.device = device
         if g_size > sum(self.module_size):
             self.module_size.append(g_size-sum(self.module_size))
         self.g_book = torch.zeros((max_states, g_size)).to(self.device)
@@ -63,7 +64,7 @@ class FixGridModule():
             id_m = torch.fmod(ind, m)
             self.g_book[ind, id_m+start_ind] = 1.0
             start_ind += m
-        print(self.g_book[:5, :10])
+        # print(self.g_book[:5, :10])
 
     def gen_seq_g(self, pos_seq):
         pos_shape = pos_seq.shape
