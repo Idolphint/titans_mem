@@ -31,14 +31,14 @@ except ImportError:
 def create_mac_block_mask(seq_len, window_size, persist_mem_len, sliding = False):
 
     def create_mac_mask(_, __, q_idx, kv_idx):
-        is_persist_mem = kv_idx < persist_mem_len
+        is_persist_mem = kv_idx < persist_mem_len  # 所有数据都对永久记忆产生注意力
         kv_without_mem = kv_idx - persist_mem_len
         causal_mask = q_idx >= kv_without_mem
 
-        if not sliding:
+        if not sliding:  # 只关注同一个块内部的
             block_diagonal = (q_idx // window_size) == (kv_without_mem // window_size)
             causal_mask = causal_mask & block_diagonal
-        else:
+        else:  # 注意causal_mask肯定保证了只关注前面的，不会关注后面的，这里限制了它只关注过去win_size的内容，不管他处于哪个block
             sliding_mask = (q_idx - kv_without_mem) <= window_size
             causal_mask = causal_mask & sliding_mask
 
@@ -823,7 +823,6 @@ class MemoryAsContextTransformer(Module):
             x = x[:, ind:(ind + 1)]
 
         # expand and reduce streams for hyper connections
-
         x = self.expand_streams(x)
         for mem_hyper_conn, attn_hyper_conn, ff_hyper_conn, mem_qkv_layer_selector, mem, attn, ff in self.layers:
 
@@ -861,10 +860,10 @@ class MemoryAsContextTransformer(Module):
                     attn_out_gates = retrieved.sigmoid()
                 else:
                     x = add_residual(retrieved)
-
+                # 需要检查这里的x shape?
             # attention
 
-            attn_in, add_residual = attn_hyper_conn(x)
+            attn_in, add_residual = attn_hyper_conn(x)  # 作为残差流维护系统，维护4个维度的数据，并每次动态加权地获得各个模块的输入
 
             mem_input_layers.append(attn_in)
 

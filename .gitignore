@@ -1,5 +1,6 @@
 train_local.py
 .DS_Store
+*.txt
 saved_models/
 wandb/
 runs/

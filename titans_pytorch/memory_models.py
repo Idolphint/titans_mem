@@ -251,3 +251,20 @@ class MemoryAttention(Module):
         ff_out = h @ ffw2
 
         return attn_out + ff_out
+
+
+# 实现一个直接输出的层以验证无mme的情况？
+class DumyMemory(Module):
+    def __init__(
+            self,
+            dim,
+            depth,
+            expansion_factor=2.
+    ):
+        super().__init__()
+
+    def forward(
+            self,
+            x
+    ):
+        return x
