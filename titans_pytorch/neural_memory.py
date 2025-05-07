@@ -94,7 +94,7 @@ def is_empty_tensor(t):
     return t.numel() == 0
 
 def dict_get_value_shapes(td):
-    return [v.shape for k, v in td.items()]
+    return [v.shape[1:] for k, v in td.items()]
 
 def rearrange_dict_values(td, pattern, **kwargs):
     return td.apply(lambda t: rearrange(t, pattern, **kwargs))

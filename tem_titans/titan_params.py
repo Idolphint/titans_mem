@@ -10,7 +10,7 @@ def default_params(width=None, height=None):
     params = DotDict()
     params.graph_mode = True
     params.batch_size = 16
-    params.seq_len=256
+    params.seq_len=128
     params.s_size= 64  # origin 45
     params.n_actions = 4
 
@@ -34,12 +34,26 @@ def default_params(width=None, height=None):
     params.mem_batch_size = 1 
     params.heads = 1
     params.momentum_order = 2
-    params.dim_head = params.dim 
+    params.dim_head = 64
     params.learned_momentum_combine = False 
-    
-    
+
+    # tem train process params
+    params.temp_it = 2000
+    params.p2g_start = -5  # 100  # iteration p2g kicks in
+    params.p2g_warmup = 1  # 200
+    params.g_gt_it = 20000000000  # 2000
+    params.g_gt_bias = 0.0  # between -1 and 1
+    params.g_reg_it = 20000000000
+
+    # loss parameters
+    params.which_costs = ['lx_g', 'lx_gt', 'lg']
+    params.lx_gt_val = 1.0
+    params.lg_val = 1.0
+    params.lg_temp = 1.0
+
     # system 
     params.device = 'cuda:0'
+    params.train_on_visited_states_only = True
 
     params.world_type = 'rectangle'
     params.rand_begin = False
@@ -73,3 +87,21 @@ def default_params(width=None, height=None):
 
     params.use_reward = True
     return params
+
+
+def get_scaling_parameters(index, par):
+    # these scale with number of gradient updates
+    temp = np.maximum(np.minimum((index + 1) / par.temp_it, 1.0), 0.0)
+    p2g_scale = 0.0 if index <= par.p2g_start else np.minimum((index - par.p2g_start) / par.p2g_warmup, 1.0)
+    g_gt = par.g_gt_bias + np.maximum(np.minimum((index + 1) / par.g_gt_it, 1.0), -1.0)
+    # g_cell_reg = 1 - np.minimum((index + 1) / par.g_reg_it, 1.0)
+
+    scalings = DotDict({'temp': temp,
+                   # 'l_r': l_r,
+                   'iteration': index,
+                   'p2g_scale': p2g_scale,
+                   'g_gen': g_gt,
+                   # 'g_cell_reg': g_cell_reg,
+                   })
+
+    return scalings

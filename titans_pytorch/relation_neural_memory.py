@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import pdb
 from typing import Callable
 
 import math
@@ -588,6 +590,7 @@ class RelationNeuralMemory(Module):
         chunk_size = self.retrieve_chunk_size
 
         weights_have_expanded_shape = dict_get_value_shapes(weights) != self.init_weight_shape
+        # weights_have_expanded_shape=False 只有batch维度的weights应该视为没有expand shape
 
         batch, seq_len = seq.shape[:2]
 
@@ -623,24 +626,17 @@ class RelationNeuralMemory(Module):
         # pre norm
 
         seq = self.retrieve_norm(seq)
-
         # sequence Float['b n d'] to queries
-
         queries = self.to_queries(seq)
-
         # maybe multihead
-
         queries = self.split_heads(queries)
-
         # maybe qk rmsnorm
-
         queries = self.q_norm(queries)
 
         # fetch values from memory model
 
         if weights_have_expanded_shape:
             weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
-
         queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
 
         # forward functional call
@@ -818,14 +814,14 @@ class RelationNeuralMemory(Module):
 
         # retrieve
 
-        if is_single_token:
-            last_update, _ = next_neural_mem_state.states
-            updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
-
-        retrieved = self.retrieve_memories(
-            retrieve_seq,
-            updates
-        )
+        # if is_single_token:
+        #     last_update, _ = next_neural_mem_state.states
+        #     updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
+        #
+        # retrieved = self.retrieve_memories(
+        #     retrieve_seq,
+        #     updates
+        # )
 
         # maybe detach
 
@@ -835,6 +831,6 @@ class RelationNeuralMemory(Module):
         # returning
 
         if not return_surprises:
-            return retrieved, next_neural_mem_state
+            return next_neural_mem_state
 
-        return retrieved, next_neural_mem_state, surprises
+        return next_neural_mem_state, surprises

@@ -17,6 +17,6 @@ from titans_pytorch.mac_transformer import (
     MemoryAsContextTransformer
 )
 
-from relation_neural_memory import (
+from titans_pytorch.relation_neural_memory import (
     RelationNeuralMemory
 )

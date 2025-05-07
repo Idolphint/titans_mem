@@ -71,12 +71,16 @@ class DotDict(dict):
 
 def default_params(width=None, height=None):
     params = DotDict()
+
+    # mem model params
     params.graph_mode = True
     params.chunk_size = 8
     params.batch_size = 16
     params.segment_size = 16
     params.seq_len=256
     params.s_size=45
+
+    # env base params
     params.world_type = 'rectangle'
     params.device = 'cuda:1'
     params.save_prefix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
