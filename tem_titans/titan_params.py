@@ -9,8 +9,8 @@ import gzip
 def default_params(width=None, height=None):
     params = DotDict()
     params.graph_mode = True
-    params.batch_size = 16
-    params.seq_len=128
+    params.batch_size = 4
+    params.seq_len=100
     params.s_size= 64  # origin 45
     params.n_actions = 4
 
@@ -18,18 +18,20 @@ def default_params(width=None, height=None):
     params.visual_dim = 64
     params.stoch_dim = 64
     
-    # grid model 
-    params.g_size = 128
-    params.g_size_project = params.g_size
+    # grid model
+    params.p_size = 256
+    params.g_size = 64
+    params.g_size_project = params.p_size # g->P
     params.g_thresh_max = 10.0
     params.g_thresh_min = -10.0
 
-    # sense model 
-    params.s_size_project = params.s_size
+    # sense model
+    params.stoch_size = params.s_size  # 暂时假设enc-dec不做编码
+    params.s_size_project = params.p_size # s->p
     params.s_size_hidden = 400
 
     # neural memory
-    params.mem_dim = params.g_size + params.s_size  # g_size + s_size
+    params.mem_dim = params.p_size  # g_size + s_size
     params.chunk_size = 1
     params.mem_batch_size = 1 
     params.heads = 1
@@ -50,6 +52,7 @@ def default_params(width=None, height=None):
     params.lx_gt_val = 1.0
     params.lg_val = 1.0
     params.lg_temp = 1.0
+    params.l_encdec = 0.1
 
     # system 
     params.device = 'cuda:0'

@@ -69,7 +69,7 @@ class RelationNeuralMemory(Module):
         mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
         default_model_kwargs: dict = dict(
             depth = 2,
-            expansion_factor = 2.  # 4
+            expansion_factor = 2
         )
     ):
         super().__init__()
@@ -380,7 +380,6 @@ class RelationNeuralMemory(Module):
         weights = TensorDict(weights)
 
         # allow for neural memory of a previous layer to influence surprise of current layer
-
         weights_for_surprise = repeat_dict_values(weights, 'b ... -> b n ...', n = num_chunks)
 
         # initial norm
@@ -634,7 +633,11 @@ class RelationNeuralMemory(Module):
         queries = self.q_norm(queries)
 
         # fetch values from memory model
-
+        if is_one_weight and seq_len > 1:
+            round_down_seq_len = round_down_multiple(seq_len, chunk_size)
+            num_chunks = round_down_seq_len // chunk_size
+            weights = repeat_dict_values(weights, 'b ... -> b n ...', n=num_chunks)
+            weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
         if weights_have_expanded_shape:
             weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
         queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)

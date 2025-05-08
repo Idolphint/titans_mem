@@ -3,6 +3,8 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.onnx.symbolic_opset9 import unsqueeze
+
 from hpc_memory_net import MemNet, BiMemNet
 from titans_pytorch import RelationNeuralMemory as Memory
 import torch.distributions as torchd
@@ -14,6 +16,58 @@ import seaborn as sns
 from titan_params import default_params, get_scaling_parameters
 import utils
 
+
+class SimpleEncDec(nn.Module):
+    def __init__(self, visual_dim, stoch_size):
+        super(SimpleEncDec, self).__init__()
+        self.enc = nn.Sequential(
+            nn.Linear(visual_dim, 256),
+            nn.LayerNorm(256),
+            nn.ELU(),
+            nn.Linear(256, stoch_size),
+        )
+
+        self.dec = nn.Sequential(
+            nn.Linear(stoch_size, 256),
+            nn.LayerNorm(256),
+            nn.ELU(),
+            nn.Linear(256, visual_dim),
+        )
+
+        self.visual_dim = visual_dim
+        self.stoch_size = stoch_size
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, sense, sample=True):
+        logits = self.enc(sense)
+        return logits
+
+    def compute_loss(self, sense, stoch_logits=None, return_dec=False, reduction='mean'):  # decoder的训练可以考虑CE损失
+        if stoch_logits is None:
+            stoch = self(sense)
+        else:
+            stoch = stoch_logits
+
+        data_shape = sense.shape
+        pred = self.dec(stoch)
+        sense_label = torch.argmax(sense, dim=-1).reshape(-1)
+        pred_flatten = pred.reshape(-1, sense.shape[-1])
+        loss = F.cross_entropy(pred_flatten, sense_label, reduction=reduction)
+
+        if reduction == "none":
+            loss = loss.reshape((data_shape[:-1]))
+        pred_label = torch.argmax(pred, dim=-1).reshape(-1)
+        acc = (pred_label==sense_label).float().mean()
+        # loss = F.mse_loss(sense.detach(), pred)
+        if return_dec:
+            return loss, pred, acc
+        return loss, acc
 
 class GridModule(nn.Module):
     def __init__(self, action_dim, g_size, expand_factor=3, device='cuda:0'):
@@ -65,7 +119,7 @@ class Dynamic(nn.Module):
         self.scaling=None
         self.grid = GridModule(self.par.n_actions, self.par.g_size, 
                                       device=self.par.device)
-
+        self.visual_encdec = SimpleEncDec(self.par.s_size, self.par.s_size_project)
         # relational memory 
         self.memory = Memory( dim = self.par.mem_dim,
                               chunk_size = self.par.chunk_size,
@@ -107,56 +161,65 @@ class Dynamic(nn.Module):
         self.MLP_x_pred = nn.Sequential(
             nn.Linear(self.par.s_size_project, self.par.s_size_hidden),
             nn.ELU(),
-            nn.Linear(self.par.s_size_hidden, self.par.s_size)
+            nn.Linear(self.par.s_size_hidden, self.par.s_size_project)
         )
         for m in self.MLP_x_pred.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def step(self, a_i, s_i, last_g, cache, t=0):
+    def step(self, a_i, x_proj, last_g, cache, t=0):
         # cache coxiaolong zou neuroscience_gen
         g_gen = self.grid(last_g, a_i)
         g_proj = self.projection_g(g_gen)
-        x_proj = s_i
+        # x_proj = s_i
 
         # memory 
         if t >0:
             # pred from g
             weight = cache.weights
-            mem_in = torch.concat([g_proj, torch.zeros_like(x_proj)],dim=-1).unsqueeze(dim=1) #(B,1,D)
-            gx = self.memory.retrieve_memories(mem_in, weights=cache.weights).squeeze(1)
+            mem_in = g_proj.unsqueeze(1)
+            # mem_in = torch.concat([g_proj, torch.zeros_like(x_proj)],dim=-1).unsqueeze(dim=1) #(B,1,D)
+            gx_gen = self.memory.retrieve_memories(mem_in, weights=cache.weights).squeeze(1)
             # gx = self.memory(seq=mem_in, store_seq=None, state = cache, detach_mem_state=True)
-            x_gen_retr, g_gen_retr = gx.split([self.par.s_size_project, self.par.g_size_project],dim=-1)
-            x_gen_pred = self.MLP_x_pred(x_gen_retr)
+            # g_gen_retr, x_gen_retr = gx.split([self.par.g_size_project, self.par.s_size_project],dim=-1)
+            x_gen_pred = self.MLP_x_pred(gx_gen)
 
             # integrate, given g+x
-            mem_in = torch.concat([g_proj, x_proj],dim=-1).unsqueeze(dim=1) #(B,1,D)
-            gx = self.memory.retrieve_memories(mem_in, weights=cache.weights).squeeze(1)
+            mem_in = (g_proj+x_proj).unsqueeze(1)
+            # mem_in = torch.concat([g_proj, x_proj],dim=-1).unsqueeze(dim=1) #(B,1,D)
+            gx_retr = self.memory.retrieve_memories(mem_in, weights=cache.weights).squeeze(1)
             # gx = self.memory(seq=mem_in, store_seq=None, state = cache, detach_mem_state=True)
-            x_retr, g_retr = gx.split([self.par.s_size_project, self.par.g_size_project],dim=-1)
-            x_retr_pred = self.MLP_x_pred(x_retr)
+            # g_retr, x_retr = gx.split([self.par.g_size_project, self.par.s_size_project], dim=-1)
+            # x_retr, g_retr = gx.split([self.par.s_size_project, self.par.g_size_project],dim=-1)
+            # g_retr, x_retr = gx, gx
+            x_retr_pred = self.MLP_x_pred(gx_retr)
 
             # correct, g_corr = g_old + scalling*delta*(g-g_old)
-            g_mu = self.p2g_mu(g_retr)
-            error_signal = F.mse_loss(x_retr_pred, s_i.reshape(x_retr_pred.shape), reduction="none")
+            g_mu = self.p2g_mu(gx_retr)
+            error_signal = F.mse_loss(x_retr_pred, x_proj.reshape(x_retr_pred.shape), reduction="none")
             error_signal = error_signal.mean(dim=-1,keepdims=True).detach()
-            delta_in = torch.concat([g_retr, g_gen_retr,error_signal],dim=-1)
+            delta_in = torch.concat([g_mu, g_gen, error_signal],dim=-1)
             g_delta = self.p2g_delta(delta_in)
             g_int = g_gen + (g_mu- g_gen) * self.scaling.p2g_scale * g_delta
+            g_int_proj = self.projection_g(g_int)
             # new pred from g_corr
-            mem_in = torch.concat([g_int, x_proj], dim=-1).unsqueeze(dim=1)
-            gx = self.memory.retrieve_memories(mem_in, weights=cache.weights).squeeze(1)
+            mem_in = (g_int_proj+x_proj).unsqueeze(1)
+            # mem_in = torch.concat([g_int, x_proj], dim=-1).unsqueeze(dim=1)
+            gx_int = self.memory.retrieve_memories(mem_in, weights=cache.weights).squeeze(1)
             # gx = self.memory(seq=mem_in, store_seq=None, state = cache, detach_mem_state=True)
-            x_int, _ = gx.split([self.par.s_size_project, self.par.g_size_project],dim=-1)
-            x_int_pred = self.MLP_x_pred(x_int)
+            # _, x_int = gx.split([self.par.g_size_project, self.par.s_size_project], dim=-1)
+            # x_int, _ = gx.split([self.par.s_size_project, self.par.g_size_project],dim=-1)
+            x_int_pred = self.MLP_x_pred(gx_int)
         else:  # t=0时记忆没有内容，只能使用现有内容
             g_int = g_gen
+            g_int_proj = g_proj
             x_gen_pred = x_proj
             x_int_pred = x_proj
 
         # storage
-        mem_in = torch.concat([g_int, x_proj],dim=-1).unsqueeze(dim=1) #(B,1,D)
+        mem_in = (g_int_proj+x_proj).unsqueeze(1)
+        # mem_in = torch.concat([g_int, x_proj],dim=-1).unsqueeze(dim=1) #(B,1,D)
         cache = self.memory(seq=mem_in, state = cache, detach_mem_state=False)
 
         return (g_gen, g_int, x_gen_pred, x_int_pred, cache)
@@ -165,7 +228,8 @@ class Dynamic(nn.Module):
     def forward(self, act_seq, sen_seq, last_g = None, cache=None):
         self.train()
         B, T, _ = act_seq.shape # BxTxD
-        
+
+        x_seq = self.visual_encdec(sen_seq)
         if last_g is None:
             last_g = self.grid.g0.repeat(B,1)
         
@@ -175,7 +239,7 @@ class Dynamic(nn.Module):
         x_int_arr = []
         
         for t in range(T):
-            g_gen, last_g, x_gen_pred, x_int_pred, cache = self.step(act_seq[:, t], sen_seq[:, t], last_g, cache, t)
+            g_gen, last_g, x_gen_pred, x_int_pred, cache = self.step(act_seq[:, t], x_seq[:, t], last_g, cache, t)
             
             g_gen_arr.append(g_gen)
             g_int_arr.append(last_g)
@@ -183,10 +247,10 @@ class Dynamic(nn.Module):
             x_int_arr.append(x_int_pred)
             
         res_dict = {}
-        res_dict["g_gen"] = torch.stack(g_gen_arr,dim=0) # (T,B,D)
-        res_dict["g_int"] = torch.stack(g_int_arr,dim=0) # (T,B,D)
-        res_dict["x_gen"] = torch.stack(x_gen_arr,dim=0) # (T,B,D)
-        res_dict["x_int"] = torch.stack(x_int_arr,dim=0) # (T,B,D)
+        res_dict["g_gen"] = torch.stack(g_gen_arr,dim=1) # (B,T,D)
+        res_dict["g_int"] = torch.stack(g_int_arr,dim=1) # (B,T,D)
+        res_dict["x_gen"] = torch.stack(x_gen_arr,dim=1) # (B,T,D)
+        res_dict["x_int"] = torch.stack(x_int_arr,dim=1) # (B,T,D)
 
         return res_dict 
 
@@ -200,32 +264,45 @@ class Dynamic(nn.Module):
         norm, s_vis = 1.0, 1.0
         
         labels = sen_seq.argmax(dim=-1) #(B,T,D)
-        # s_visited (T, B)
-        # print(res["x_gen"].shape, labels.shape)
-        # pdb.set_trace()
+        # encdec_loss, _ = self.visual_encdec.compute_loss(sen_seq)
+
+        lx_gen_, _ = self.visual_encdec.compute_loss(sen_seq, res["x_gen"], reduction="none")
+        lx_gint_, _ = self.visual_encdec.compute_loss(sen_seq, res["x_int"], reduction="none")
+        lg_ = F.mse_loss(res["g_gen"], res["g_int"], reduction="none").mean(-1)
+
+        if self.par.train_on_visited_states_only:
+            s_vis = s_visited
+            batch_vis = torch.sum(s_vis) + eps
+            # normalize sequence length
+            norm = 1.0 / batch_vis
+        lx_gen = (lx_gen_ * s_vis).sum()*norm * self.par.lx_gt_val
+        lx_gint = (lx_gint_ * s_vis).sum() * norm
+        lg = (lg_ * s_vis).sum() * self.par.lg_val * norm
+
         # losses
-        for t in range(self.par.seq_len):
-            lx_gen_ = F.cross_entropy(res["x_gen"][t], labels[:,t], reduction="none")  # 应该是g2s->labels吧？
-            lx_gint_ = F.cross_entropy(res["x_int"][t], labels[:,t], reduction="none")
-
-            lg_ = F.mse_loss(res["g_gen"][t], res["g_int"][t], reduction="none").mean(-1)
-
-            if self.par.train_on_visited_states_only:
-                s_vis = s_visited[:, t]
-                batch_vis = torch.sum(s_vis) + eps
-                # normalize sequence length
-                norm = 1.0 / (batch_vis * self.par.seq_len)
-            
-            lx_gen += torch.sum(lx_gen_ * s_vis) * norm * self.par.lx_gt_val
-            lx_gint += torch.sum(lx_gint_ * s_vis) * norm
-            # pdb.set_trace()
-            lg += torch.sum(lg_ * s_vis) * self.par.lg_val * norm
+        # for t in range(self.par.seq_len):
+        #     lx_gen_ = F.cross_entropy(res["x_gen"][t], labels[:,t], reduction="none")  # 应该是g2s->labels吧？
+        #     lx_gint_ = F.cross_entropy(res["x_int"][t], labels[:,t], reduction="none")
+        #
+        #     lg_ = F.mse_loss(res["g_gen"][t], res["g_int"][t], reduction="none").mean(-1)
+        #
+        #     if self.par.train_on_visited_states_only:
+        #         s_vis = s_visited[:, t]
+        #         batch_vis = torch.sum(s_vis) + eps
+        #         # normalize sequence length
+        #         norm = 1.0 / (batch_vis * self.par.seq_len)
+        #
+        #     lx_gen += torch.sum(lx_gen_ * s_vis) * norm * self.par.lx_gt_val
+        #     lx_gint += torch.sum(lx_gint_ * s_vis) * norm
+        #     # pdb.set_trace()
+        #     lg += torch.sum(lg_ * s_vis) * self.par.lg_val * norm
         
         losses = utils.DotDict()
         cost_all = 0.0 
 
         losses.lx_gen = lx_gen
         losses.lx_gint = lx_gint
+        # losses.encdec = encdec_loss
 
         if 'lx_gen' in self.par.which_costs:
             cost_all += lx_gen * (1 + self.scaling.g_gen)
@@ -235,6 +312,8 @@ class Dynamic(nn.Module):
             cost_all += lg * self.scaling.temp * self.par.lg_temp
             losses.lg = lg * self.scaling.temp * self.par.lg_temp
             losses.lg_unscaled = lg
+
+        # cost_all += encdec_loss * self.par.l_encdec
         
         losses.train_loss = cost_all
         return losses
@@ -273,6 +352,88 @@ class Trainer:
             if e % 20 == 0:
                 print(f"{e}: x_gen={loss.lx_gen.item():.2f}, "
                       f"x_int={loss.lx_gint.item():.2f}, g_corr={loss.lg_unscaled.item():.2f}")
+                torch.save(self.dynamic.state_dict(), "../saved_models/gms_net.pth")
+
+    @torch.no_grad()
+    def eval(self, load=True):
+        if load:
+            ckpt = torch.load("../saved_models/gms_net.pth")
+            self.dynamic.load_state_dict(ckpt)
+            self.dynamic.to(self.device)
+
+            lr_scaling = get_scaling_parameters(100, self.par)
+            self.dynamic.scaling = lr_scaling
+        env = init_env(self.par)
+        data = gen_data(env, self.par)
+
+        act = torch.from_numpy(data["dirs"]).to(self.device).float()
+        sen_seq = torch.from_numpy(data["sense"]).to(self.device).float()  # (B, T, D)
+        s_visited = torch.from_numpy(data["visit"]).to(self.device).float()  # (B,T)
+
+        res = self.dynamic(act, sen_seq, last_g=None, cache=None)
+        g_proj = self.dynamic.projection_g(res["g_int"])
+        g_gen_proj = self.dynamic.projection_g(res["g_gen"])
+        s_proj = self.dynamic.visual_encdec(sen_seq)
+
+        mem_in = g_proj + s_proj
+        print(mem_in.shape)
+        cache = None
+        for i in range(10):
+            cache = self.dynamic.memory(seq=mem_in, state=cache, detach_mem_state=False)
+
+            gx_full = self.dynamic.memory.retrieve_memories(mem_in, weights=cache.weights)
+            gx_only_g = self.dynamic.memory.retrieve_memories(g_proj, weights=cache.weights)
+            gx_gen = self.dynamic.memory.retrieve_memories(g_gen_proj, weights=cache.weights)
+
+            remem_full_err = F.mse_loss(gx_full, mem_in)
+            remem_from_g = F.mse_loss(gx_only_g, mem_in)
+            remem_from_gen = F.mse_loss(gx_gen, mem_in)
+            print("err by full", remem_full_err.item(), remem_from_g.item(), remem_from_gen.item())
+
+        pdb.set_trace()
+
+    def pretrain(self):
+        self.dynamic.to(self.device)
+        self.dynamic.train()
+        for e in range(10000):
+            lr_scaling = get_scaling_parameters(e, self.par)
+            self.dynamic.scaling = lr_scaling
+            env = init_env(self.par)
+            data = gen_data(env, self.par)
+
+            act = torch.from_numpy(data["dirs"]).to(self.device).float()
+            sen_seq = torch.from_numpy(data["sense"]).to(self.device).float()  # (B, T, D)
+            with torch.no_grad():
+                res = self.dynamic(act, sen_seq, last_g=None, cache=None)
+                g_proj = self.dynamic.projection_g(res["g_int"])
+                g_gen_proj = self.dynamic.projection_g(res["g_gen"])
+                s_proj = self.dynamic.visual_encdec(sen_seq)
+
+            mem_in = g_proj + s_proj
+            cache = None
+            # 记忆的三个损失
+            cache = self.dynamic.memory(seq=mem_in, state=cache, detach_mem_state=False)
+            gx_full = self.dynamic.memory.retrieve_memories(mem_in, weights=cache.weights)
+            # print("re 1 gpu use", torch.cuda.memory_allocated() // 1024 ** 2)
+            # for t in range(3):
+            #     gx_only_g = self.dynamic.memory.retrieve_memories(g_proj, weights=cache.weights)
+            #     g_proj = gx_only_g
+            # # print("re 2gpu use", torch.cuda.memory_allocated() // 1024 ** 2)
+            # gx_gen = self.dynamic.memory.retrieve_memories(g_gen_proj, weights=cache.weights)
+
+            remem_full_err = F.mse_loss(gx_full, mem_in)
+            # remem_from_g = F.mse_loss(gx_only_g, mem_in)
+            # remem_from_gen = F.mse_loss(gx_gen, mem_in)
+
+            loss = remem_full_err # + remem_from_g + remem_from_gen
+
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
+
+            if e % 20 == 0:
+                print("err by full", remem_full_err.item(),)# remem_from_g.item(), remem_from_gen.item())
+                torch.save(self.dynamic.state_dict(), "../saved_models/pretrain_memory.pth")
 
 
     # def eval(self, load=True):
@@ -311,6 +472,7 @@ if __name__ == '__main__':
     random.seed(seed)
 
     trainer = Trainer()
-    trainer.seq_train(num_episode=10000)
+    # trainer.seq_train(num_episode=10000)
     # trainer.visual()
     # trainer.eval()
+    trainer.pretrain()
